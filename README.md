@@ -204,11 +204,11 @@ To implement WADI on a real model (e.g., Llama):
 If you use WADI in your research:
 
 ```bibtex
-@software{wadi2025,
+@software{wadi2026,
   title={WADI: Wavefront Adaptive-Depth Inference},
   author={Harshit Saxena},
-  year={2025},
-  url={https://github.com/YOUR_USERNAME/wadi}
+  year={2026},
+  url={https://github.com/whyharshit7/wadi}
 }
 ```
 
