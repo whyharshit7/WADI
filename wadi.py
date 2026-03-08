@@ -11,8 +11,8 @@ Core inference algorithm implementing:
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
-from model import Transformer, TransformerConfig, KVCache, softmax
+from typing import List, Tuple, Dict
+from model import Transformer, KVCache, softmax
 
 
 @dataclass
@@ -61,6 +61,8 @@ class WADIStats:
     rejected_draft_tokens: int = 0
     verification_passes: int = 0
     exit_layer_counts: Dict[int, int] = field(default_factory=dict)
+    exit_layer_accepted: Dict[int, int] = field(default_factory=dict)
+    exit_layer_rejected: Dict[int, int] = field(default_factory=dict)
     threshold_history: List[Dict[int, float]] = field(default_factory=list)
     flops_draft: int = 0
     flops_verify: int = 0
@@ -80,6 +82,14 @@ class WADIStats:
         return weighted / total if total > 0 else 0
 
     def summary(self):
+        layer_acceptance = {}
+        for ell in sorted(set(self.exit_layer_accepted) | set(self.exit_layer_rejected)):
+            accepted = self.exit_layer_accepted.get(ell, 0)
+            rejected = self.exit_layer_rejected.get(ell, 0)
+            attempts = accepted + rejected
+            if attempts > 0:
+                layer_acceptance[ell] = accepted / attempts
+
         lines = [
             "=== WADI Inference Statistics ===",
             f"  Tokens generated:        {self.tokens_generated}",
@@ -91,6 +101,7 @@ class WADIStats:
             f"  Avg tokens/verify:       {self.total_draft_tokens / max(1, self.verification_passes):.1f}",
             f"  Avg exit depth:          {self.avg_exit_depth:.1f}",
             f"  Exit layer distribution: {dict(sorted(self.exit_layer_counts.items()))}",
+            f"  Exit acceptance:         {dict(sorted((k, round(v, 3)) for k, v in layer_acceptance.items()))}",
             f"  Draft FLOPs:             {self.flops_draft:,}",
             f"  Verify FLOPs:            {self.flops_verify:,}",
             f"  Total FLOPs:             {self.flops_draft + self.flops_verify:,}",
@@ -191,7 +202,7 @@ class WADIEngine:
     def _verify_and_accept(self, drafts: List[DraftToken],
                            verify_cache: KVCache,
                            verify_start_pos: int,
-                           context_token: int) -> Tuple[List[int], int]:
+                           context_token: int) -> Tuple[List[int], int, Dict[int, int], Dict[int, int]]:
         """
         Verify draft tokens using full-depth forward passes.
         Uses rejection sampling for lossless generation.
@@ -200,12 +211,15 @@ class WADIEngine:
         """
         self.stats.verification_passes += 1
         accepted_tokens = []
+        accepted_by_exit = {}
+        rejected_by_exit = {}
 
         # We need to verify: given context, is each draft token acceptable?
         # Run the full model on the context token first to get p_full for draft[0]
         current_token = context_token
 
         for i, draft in enumerate(drafts):
+            ell = draft.exit_layer
             self.model.reset_flops()
 
             # Full-depth forward pass
@@ -226,6 +240,8 @@ class WADIEngine:
                 accepted_tokens.append(draft.token_id)
                 current_token = draft.token_id
                 self.stats.accepted_draft_tokens += 1
+                self.stats.exit_layer_accepted[ell] = self.stats.exit_layer_accepted.get(ell, 0) + 1
+                accepted_by_exit[ell] = accepted_by_exit.get(ell, 0) + 1
             else:
                 # Reject: resample from adjusted distribution
                 # p_adjusted(x) = max(0, p_full(x) - p_draft(x)) / Z
@@ -238,19 +254,27 @@ class WADIEngine:
                     resampled = self._sample_token(full_probs)
                 accepted_tokens.append(resampled)
                 self.stats.rejected_draft_tokens += 1
+                self.stats.exit_layer_rejected[ell] = self.stats.exit_layer_rejected.get(ell, 0) + 1
+                rejected_by_exit[ell] = rejected_by_exit.get(ell, 0) + 1
                 break  # Discard remaining drafts
 
-        return accepted_tokens, len(accepted_tokens)
+        return accepted_tokens, len(accepted_tokens), accepted_by_exit, rejected_by_exit
 
-    def _adapt_thresholds(self):
-        """Adjust entropy thresholds based on recent acceptance rate."""
-        alpha = self.stats.acceptance_rate
+    def _adapt_thresholds(self, accepted_by_exit: Dict[int, int], rejected_by_exit: Dict[int, int]):
+        """Adjust entropy thresholds using each exit layer's local acceptance signal."""
         alpha_target = self.config.target_acceptance_rate
-        delta = self.config.threshold_lr * (alpha - alpha_target)
 
         for ell in self.thresholds:
             if ell == self.model.config.n_layers:
                 continue  # Final layer always exits
+            accepted = accepted_by_exit.get(ell, 0)
+            rejected = rejected_by_exit.get(ell, 0)
+            attempts = accepted + rejected
+            if attempts == 0:
+                continue
+
+            alpha = accepted / attempts
+            delta = self.config.threshold_lr * (alpha - alpha_target)
             self.thresholds[ell] = np.clip(
                 self.thresholds[ell] + delta,
                 self.config.min_threshold,
@@ -281,7 +305,7 @@ class WADIEngine:
             raise ValueError("prompt_tokens must contain at least one token")
 
         # --- Prefill: process prompt through full model ---
-        prefill_cache = KVCache(config.n_layers)
+        prefill_cache = self.model.create_kv_cache()
         for i, tok in enumerate(prompt_tokens[:-1]):
             self.model.full_forward_single(tok, prefill_cache, i)
 
@@ -316,7 +340,7 @@ class WADIEngine:
 
             # Phase 2: Verification using full model
             verify_cache = prefill_cache  # Reuse the clean cache
-            accepted, n_accepted = self._verify_and_accept(
+            accepted, n_accepted, accepted_by_exit, rejected_by_exit = self._verify_and_accept(
                 drafts, verify_cache, current_pos, current_token
             )
 
@@ -340,7 +364,7 @@ class WADIEngine:
                     verify_cache.truncate(layer_idx, target_len)
 
             # Phase 4: Adaptive threshold tuning
-            self._adapt_thresholds()
+            self._adapt_thresholds(accepted_by_exit, rejected_by_exit)
 
         return np.array(generated[:len(prompt_tokens) + max_new_tokens])
 
@@ -365,7 +389,7 @@ class StandardInference:
         if not generated:
             raise ValueError("prompt_tokens must contain at least one token")
 
-        kv_cache = KVCache(config.n_layers)
+        kv_cache = self.model.create_kv_cache()
 
         # Prefill
         for i, tok in enumerate(prompt_tokens[:-1]):
@@ -419,8 +443,8 @@ class SpeculativeDecodingBaseline:
         if not generated:
             raise ValueError("prompt_tokens must contain at least one token")
 
-        target_cache = KVCache(config_target.n_layers)
-        draft_cache = KVCache(config_draft.n_layers)
+        target_cache = self.target.create_kv_cache()
+        draft_cache = self.draft.create_kv_cache()
 
         # Prefill both models
         for i, tok in enumerate(prompt_tokens[:-1]):

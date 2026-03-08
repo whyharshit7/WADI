@@ -6,8 +6,7 @@ Comprehensive comparison with latency-oriented metrics.
 
 import copy
 import numpy as np
-import time
-from model import Transformer, TransformerConfig, KVCache
+from model import Transformer, TransformerConfig
 from wadi import WADIEngine, WADIConfig, StandardInference, SpeculativeDecodingBaseline
 
 
@@ -24,7 +23,7 @@ def make_model(config, seed=42, distill=True):
 
 def measure_entropy(model, prompt, n=40):
     config = model.config
-    kv = KVCache(config.n_layers)
+    kv = model.create_kv_cache()
     for i, t in enumerate(prompt[:-1]):
         model.full_forward_single(t, kv, i)
 

@@ -43,33 +43,78 @@ def layer_norm(x, gamma, beta, eps=1e-5):
 class KVCache:
     """Key-Value cache for efficient autoregressive inference."""
 
-    def __init__(self, n_layers, n_heads=0, d_head=0, max_seq_len=0):
+    def __init__(self, n_layers, n_heads=0, d_head=0, max_seq_len=0, dtype=np.float32):
         self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.max_seq_len = max_seq_len
+        self.dtype = dtype
         self.keys = [None] * n_layers
         self.values = [None] * n_layers
+        self.lengths = np.zeros(n_layers, dtype=np.int32)
+
+    def _supports_preallocation(self):
+        return self.n_heads > 0 and self.d_head > 0 and self.max_seq_len > 0
+
+    def _ensure_layer_buffers(self, layer_idx):
+        if self.keys[layer_idx] is not None or not self._supports_preallocation():
+            return
+        shape = (self.n_heads, self.max_seq_len, self.d_head)
+        self.keys[layer_idx] = np.empty(shape, dtype=self.dtype)
+        self.values[layer_idx] = np.empty(shape, dtype=self.dtype)
 
     def update(self, layer_idx, new_k, new_v):
         """Append new K,V to cache. new_k/new_v: (n_heads, n_new, d_head)"""
+        cur_len = int(self.lengths[layer_idx])
+        n_new = new_k.shape[1]
+
         if self.keys[layer_idx] is None:
-            self.keys[layer_idx] = new_k
-            self.values[layer_idx] = new_v
-        else:
-            self.keys[layer_idx] = np.concatenate([self.keys[layer_idx], new_k], axis=1)
-            self.values[layer_idx] = np.concatenate([self.values[layer_idx], new_v], axis=1)
+            self._ensure_layer_buffers(layer_idx)
+
+        if self.keys[layer_idx] is None:
+            self.keys[layer_idx] = new_k.copy()
+            self.values[layer_idx] = new_v.copy()
+            self.lengths[layer_idx] = n_new
+            return
+
+        if self._supports_preallocation() and self.keys[layer_idx].shape[1] == self.max_seq_len:
+            end = cur_len + n_new
+            if end > self.max_seq_len:
+                raise ValueError(f"KV cache overflow at layer {layer_idx}: {end} > {self.max_seq_len}")
+            self.keys[layer_idx][:, cur_len:end, :] = new_k
+            self.values[layer_idx][:, cur_len:end, :] = new_v
+            self.lengths[layer_idx] = end
+            return
+
+        active_k = self.keys[layer_idx][:, :cur_len, :]
+        active_v = self.values[layer_idx][:, :cur_len, :]
+        self.keys[layer_idx] = np.concatenate([active_k, new_k], axis=1)
+        self.values[layer_idx] = np.concatenate([active_v, new_v], axis=1)
+        self.lengths[layer_idx] = cur_len + n_new
 
     def get(self, layer_idx):
-        return self.keys[layer_idx], self.values[layer_idx]
+        if self.keys[layer_idx] is None:
+            return None, None
+        cur_len = int(self.lengths[layer_idx])
+        return self.keys[layer_idx][:, :cur_len, :], self.values[layer_idx][:, :cur_len, :]
 
     def get_seq_len(self, layer_idx=0):
-        if self.keys[layer_idx] is None:
-            return 0
-        return self.keys[layer_idx].shape[1]
+        return int(self.lengths[layer_idx])
 
     def truncate(self, layer_idx, length):
         """Truncate cache for a layer to a given length."""
-        if self.keys[layer_idx] is not None and length < self.keys[layer_idx].shape[1]:
-            self.keys[layer_idx] = self.keys[layer_idx][:, :length, :]
-            self.values[layer_idx] = self.values[layer_idx][:, :length, :]
+        cur_len = int(self.lengths[layer_idx])
+        if self.keys[layer_idx] is None or length >= cur_len:
+            return
+
+        self.lengths[layer_idx] = length
+        if not (self._supports_preallocation() and self.keys[layer_idx].shape[1] == self.max_seq_len):
+            if length == 0:
+                self.keys[layer_idx] = None
+                self.values[layer_idx] = None
+            else:
+                self.keys[layer_idx] = self.keys[layer_idx][:, :length, :]
+                self.values[layer_idx] = self.values[layer_idx][:, :length, :]
 
     def truncate_all(self, length):
         """Truncate all layer caches to a given length."""
@@ -78,11 +123,26 @@ class KVCache:
 
     def clone(self):
         """Deep copy."""
-        new_cache = KVCache(self.n_layers)
+        new_cache = KVCache(
+            self.n_layers,
+            n_heads=self.n_heads,
+            d_head=self.d_head,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
         for i in range(self.n_layers):
-            if self.keys[i] is not None:
-                new_cache.keys[i] = self.keys[i].copy()
-                new_cache.values[i] = self.values[i].copy()
+            cur_len = int(self.lengths[i])
+            if cur_len == 0:
+                continue
+
+            if new_cache._supports_preallocation():
+                new_cache._ensure_layer_buffers(i)
+                new_cache.keys[i][:, :cur_len, :] = self.keys[i][:, :cur_len, :]
+                new_cache.values[i][:, :cur_len, :] = self.values[i][:, :cur_len, :]
+            else:
+                new_cache.keys[i] = self.keys[i][:, :cur_len, :].copy()
+                new_cache.values[i] = self.values[i][:, :cur_len, :].copy()
+            new_cache.lengths[i] = cur_len
         return new_cache
 
 
@@ -119,13 +179,24 @@ class TransformerLayer:
     def attention(self, x, kv_cache: Optional[KVCache] = None):
         seq_len = x.shape[0]
 
-        Q = np.einsum('sd,dhk->shk', x, self.W_q)
-        K = np.einsum('sd,dhk->shk', x, self.W_k)
-        V = np.einsum('sd,dhk->shk', x, self.W_v)
+        if seq_len == 1:
+            x0 = x[0]
+            Q = np.einsum('d,dhk->hk', x0, self.W_q)
+            K = np.einsum('d,dhk->hk', x0, self.W_k)[:, np.newaxis, :]
+            V = np.einsum('d,dhk->hk', x0, self.W_v)[:, np.newaxis, :]
 
-        Q = Q.transpose(1, 0, 2)
-        K = K.transpose(1, 0, 2)
-        V = V.transpose(1, 0, 2)
+            if kv_cache is not None:
+                kv_cache.update(self.layer_idx, K, V)
+                K, V = kv_cache.get(self.layer_idx)
+
+            scores = np.einsum('hd,hkd->hk', Q, K) * self.attn_scale
+            attn = softmax(scores, axis=-1)
+            out = np.einsum('hk,hkd->hd', attn, V)
+            return np.einsum('hd,hdo->o', out, self.W_o)[np.newaxis, :]
+
+        Q = np.einsum('sd,dhk->shk', x, self.W_q).transpose(1, 0, 2)
+        K = np.einsum('sd,dhk->shk', x, self.W_k).transpose(1, 0, 2)
+        V = np.einsum('sd,dhk->shk', x, self.W_v).transpose(1, 0, 2)
 
         if kv_cache is not None:
             kv_cache.update(self.layer_idx, K, V)
@@ -199,6 +270,15 @@ class Transformer:
             self.exit_heads[ell] = ExitHead(config.d_model, config.vocab_size, rng)
 
         self.flop_counter = 0
+
+    def create_kv_cache(self):
+        return KVCache(
+            self.config.n_layers,
+            n_heads=self.config.n_heads,
+            d_head=self.config.d_head,
+            max_seq_len=self.config.max_seq_len,
+            dtype=self.tok_emb.dtype,
+        )
 
     def embed(self, token_ids, start_pos=0):
         seq_len = len(token_ids)
