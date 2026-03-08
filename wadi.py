@@ -277,15 +277,18 @@ class WADIEngine:
 
         config = self.model.config
         generated = list(prompt_tokens)
+        if not generated:
+            raise ValueError("prompt_tokens must contain at least one token")
 
         # --- Prefill: process prompt through full model ---
         prefill_cache = KVCache(config.n_layers)
-        for i, tok in enumerate(prompt_tokens):
+        for i, tok in enumerate(prompt_tokens[:-1]):
             self.model.full_forward_single(tok, prefill_cache, i)
 
         # Main generation loop
         tokens_left = max_new_tokens
-        current_pos = len(prompt_tokens)
+        current_token = int(prompt_tokens[-1])
+        current_pos = len(prompt_tokens) - 1
 
         while tokens_left > 0:
             # Phase 1: Draft generation with early exit
@@ -294,13 +297,14 @@ class WADIEngine:
 
             n_drafts = min(self.config.max_draft_len, tokens_left)
             drafts = []
-            current_token = generated[-1]
-            draft_start_pos = current_pos
+            draft_token = current_token
+            draft_pos = current_pos
 
-            for d in range(n_drafts):
-                draft = self._draft_one_token(current_token, draft_cache, draft_start_pos + d)
+            for _ in range(n_drafts):
+                draft = self._draft_one_token(draft_token, draft_cache, draft_pos)
                 drafts.append(draft)
-                current_token = draft.token_id
+                draft_token = draft.token_id
+                draft_pos += 1
                 self.stats.total_draft_tokens += 1
 
             self.stats.flops_draft += self.model.get_flops()
@@ -313,7 +317,7 @@ class WADIEngine:
             # Phase 2: Verification using full model
             verify_cache = prefill_cache  # Reuse the clean cache
             accepted, n_accepted = self._verify_and_accept(
-                drafts, verify_cache, current_pos - 1, generated[-1]
+                drafts, verify_cache, current_pos, current_token
             )
 
             if verbose:
@@ -324,6 +328,7 @@ class WADIEngine:
             current_pos += n_accepted
             tokens_left -= n_accepted
             self.stats.tokens_generated += n_accepted
+            current_token = accepted[-1]
 
             # The verify_cache (which is prefill_cache) has been updated
             # through the verification forward passes up to the accepted tokens.
@@ -357,19 +362,21 @@ class StandardInference:
         config = self.model.config
         self.model.reset_flops()
         generated = list(prompt_tokens)
+        if not generated:
+            raise ValueError("prompt_tokens must contain at least one token")
 
         kv_cache = KVCache(config.n_layers)
 
         # Prefill
-        for i, tok in enumerate(prompt_tokens):
+        for i, tok in enumerate(prompt_tokens[:-1]):
             self.model.full_forward_single(tok, kv_cache, i)
+
+        current_token = int(prompt_tokens[-1])
+        current_pos = len(prompt_tokens) - 1
 
         # Autoregressive generation
         for step in range(max_new_tokens):
-            current_token = generated[-1]
-            pos = len(generated) - 1
-
-            probs, entropy = self.model.full_forward_single(current_token, kv_cache, pos)
+            probs, entropy = self.model.full_forward_single(current_token, kv_cache, current_pos)
 
             if self.temperature != 1.0:
                 logits = np.log(probs + 1e-10) / self.temperature
@@ -377,6 +384,8 @@ class StandardInference:
 
             next_token = self.rng.choice(len(probs), p=probs)
             generated.append(next_token)
+            current_token = next_token
+            current_pos += 1
 
             if verbose and step < 10:
                 print(f"  Step {step}: token={next_token}, entropy={entropy:.2f}")
@@ -407,42 +416,48 @@ class SpeculativeDecodingBaseline:
         config_target = self.target.config
         config_draft = self.draft.config
         generated = list(prompt_tokens)
+        if not generated:
+            raise ValueError("prompt_tokens must contain at least one token")
 
         target_cache = KVCache(config_target.n_layers)
         draft_cache = KVCache(config_draft.n_layers)
 
         # Prefill both models
-        for i, tok in enumerate(prompt_tokens):
+        for i, tok in enumerate(prompt_tokens[:-1]):
             self.target.full_forward_single(tok, target_cache, i)
             self.draft.full_forward_single(tok, draft_cache, i)
 
         tokens_left = max_new_tokens
+        current_token = int(prompt_tokens[-1])
+        current_pos = len(prompt_tokens) - 1
 
         while tokens_left > 0:
             # Draft phase
             draft_tokens = []
             draft_probs_list = []
             draft_cache_copy = draft_cache.clone()
-            current = generated[-1]
+            draft_current = current_token
+            draft_pos = current_pos
 
             n = min(self.draft_len, tokens_left)
-            for d in range(n):
-                pos = len(generated) + d - 1
-                probs, _ = self.draft.full_forward_single(current, draft_cache_copy, pos)
+            for _ in range(n):
+                probs, _ = self.draft.full_forward_single(draft_current, draft_cache_copy, draft_pos)
                 tok = self.rng.choice(len(probs), p=probs)
                 draft_tokens.append(tok)
                 draft_probs_list.append(probs)
-                current = tok
+                draft_current = tok
+                draft_pos += 1
 
             # Verify phase
             accepted_tokens = []
-            verify_current = generated[-1]
+            verify_current = current_token
 
             for i, dtok in enumerate(draft_tokens):
-                pos = len(generated) + i - 1
+                pos = current_pos + i
                 target_probs, _ = self.target.full_forward_single(
                     verify_current, target_cache, pos
                 )
+                self.draft.full_forward_single(verify_current, draft_cache, pos)
 
                 tp = target_probs[dtok]
                 dp = draft_probs_list[i][dtok]
@@ -453,8 +468,6 @@ class SpeculativeDecodingBaseline:
                     accepted_tokens.append(dtok)
                     verify_current = dtok
                     self.accepted += 1
-                    # Also advance draft cache
-                    self.draft.full_forward_single(dtok, draft_cache, pos)
                 else:
                     adjusted = np.maximum(0, target_probs - draft_probs_list[i])
                     z = np.sum(adjusted)
@@ -464,11 +477,12 @@ class SpeculativeDecodingBaseline:
                     else:
                         resampled = self.rng.choice(len(target_probs), p=target_probs)
                     accepted_tokens.append(resampled)
-                    self.draft.full_forward_single(resampled, draft_cache, pos)
                     break
 
             generated.extend(accepted_tokens)
             tokens_left -= len(accepted_tokens)
+            current_token = accepted_tokens[-1]
+            current_pos += len(accepted_tokens)
 
             if verbose and len(generated) < len(prompt_tokens) + 20:
                 print(f"  Spec: drafted {len(draft_tokens)}, accepted {len(accepted_tokens)}")

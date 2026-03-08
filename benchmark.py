@@ -4,6 +4,7 @@ WADI Proof-of-Concept Benchmark
 Comprehensive comparison with latency-oriented metrics.
 """
 
+import copy
 import numpy as np
 import time
 from model import Transformer, TransformerConfig, KVCache
@@ -24,7 +25,7 @@ def make_model(config, seed=42, distill=True):
 def measure_entropy(model, prompt, n=40):
     config = model.config
     kv = KVCache(config.n_layers)
-    for i, t in enumerate(prompt):
+    for i, t in enumerate(prompt[:-1]):
         model.full_forward_single(t, kv, i)
 
     rng = np.random.default_rng(0)
@@ -74,11 +75,12 @@ def run():
 
     # === Entropy profile ===
     section("2. Distilled Exit Head Entropy")
-    cm = make_model(cfg, seed=42)
+    base_target = make_model(cfg, seed=42)
+    base_draft = make_model(dcfg, seed=99, distill=False)
     prompt = create_prompt(cfg.vocab_size, 16, seed=7)
     gen_len = 60
 
-    ent = measure_entropy(cm, prompt)
+    ent = measure_entropy(base_target, prompt)
     print(f"  {'Layer':>6} {'Mean H':>7} {'Std':>6} {'P25':>6} {'P75':>6}")
     print("  " + "-" * 35)
     for e in sorted(ent):
@@ -93,7 +95,7 @@ def run():
 
     # === Standard AR ===
     section("3. Standard Autoregressive")
-    std_m = make_model(cfg, seed=42)
+    std_m = copy.deepcopy(base_target)
     std = StandardInference(std_m)
     std.generate(prompt, gen_len)
     std_flops = std.total_flops
@@ -103,8 +105,8 @@ def run():
 
     # === Speculative Decoding ===
     section("4. Speculative Decoding")
-    st = make_model(cfg, seed=42)
-    sd = make_model(dcfg, seed=99, distill=False)
+    st = copy.deepcopy(base_target)
+    sd = copy.deepcopy(base_draft)
     spec = SpeculativeDecodingBaseline(st, sd, draft_len=5)
     spec.generate(prompt, gen_len)
     spec_flops = spec.total_flops_target + spec.total_flops_draft
@@ -126,7 +128,7 @@ def run():
 
     # === WADI ===
     section("5. WADI Inference")
-    wm = make_model(cfg, seed=42)
+    wm = copy.deepcopy(base_target)
     wcfg = WADIConfig(
         initial_thresholds=auto_th,
         max_draft_len=6,
@@ -167,7 +169,7 @@ def run():
         for e in sorted(ent):
             th[e] = float(np.percentile(np.array(ent[e]), pct)) if e != L else float('inf')
 
-        m = make_model(cfg, seed=42)
+        m = copy.deepcopy(base_target)
         c = WADIConfig(initial_thresholds=th, max_draft_len=6,
                        target_acceptance_rate=0.75, threshold_lr=0.03)
         eng = WADIEngine(m, c)
