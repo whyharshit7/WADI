@@ -337,6 +337,8 @@ def verify_and_accept(
 
     accepted: List[int] = []
     n_drafts_kept = 0
+    per_exit_acc: Dict[int, int] = {}
+    per_exit_rej: Dict[int, int] = {}
     for i, d in enumerate(drafts):
         p_full = float(full_probs[i, d.token_id].item())
         p_draft = float(d.probs[d.token_id].item())
@@ -344,7 +346,9 @@ def verify_and_accept(
         if torch.rand(()).item() < r:
             accepted.append(d.token_id)
             n_drafts_kept += 1
+            per_exit_acc[d.exit_layer] = per_exit_acc.get(d.exit_layer, 0) + 1
         else:
+            per_exit_rej[d.exit_layer] = per_exit_rej.get(d.exit_layer, 0) + 1
             residual = torch.clamp(full_probs[i] - d.probs.to(full_probs.device), min=0)
             z = residual.sum()
             dist = residual / z if z > 1e-10 else full_probs[i]
@@ -352,7 +356,7 @@ def verify_and_accept(
             break
 
     cache.crop(cache_before + len(accepted))
-    return accepted, n_drafts_kept
+    return accepted, n_drafts_kept, per_exit_acc, per_exit_rej
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +406,7 @@ def generate_wadi(
 
     stats = {
         "drafts": 0, "drafts_accepted": 0, "rounds": 0, "rejections": 0,
-        "exit_hist": {},
+        "exit_hist": {}, "exit_accepted": {}, "exit_rejected": {},
     }
 
     tokens_left = max_new_tokens
@@ -419,12 +423,18 @@ def generate_wadi(
             stats["exit_hist"][d.exit_layer] = stats["exit_hist"].get(d.exit_layer, 0) + 1
             draft_tok = d.token_id
 
-        accepted, n_kept = verify_and_accept(model, drafts, current_token, cache)
+        accepted, n_kept, per_exit_acc, per_exit_rej = verify_and_accept(
+            model, drafts, current_token, cache
+        )
         generated.extend(accepted)
         stats["rounds"] += 1
         stats["drafts_accepted"] += n_kept
         if n_kept < len(drafts):
             stats["rejections"] += 1
+        for ell, c in per_exit_acc.items():
+            stats["exit_accepted"][ell] = stats["exit_accepted"].get(ell, 0) + c
+        for ell, c in per_exit_rej.items():
+            stats["exit_rejected"][ell] = stats["exit_rejected"].get(ell, 0) + c
         tokens_left -= len(accepted)
         current_token = accepted[-1]
 
@@ -547,6 +557,13 @@ def main() -> None:
           f"{(args.max_new_tokens) / max(1, stats['rounds']):.1f}")
     print(f"  Exit distribution: "
           f"{dict(sorted(stats['exit_hist'].items()))}")
+    print(f"  Per-exit acceptance:")
+    for ell in sorted(stats["exit_hist"]):
+        acc = stats["exit_accepted"].get(ell, 0)
+        rej = stats["exit_rejected"].get(ell, 0)
+        tot = acc + rej
+        rate = (acc / tot) if tot else 0.0
+        print(f"    L{ell}: {acc}/{tot} accepted ({rate:.1%})")
 
     print("\n--- Output ---")
     print(tokenizer.decode(wadi_tokens, skip_special_tokens=True))
