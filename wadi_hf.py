@@ -221,7 +221,7 @@ def calibrate_thresholds(
             probs = F.softmax(head(h).float(), dim=-1)
             ent = -(probs * probs.clamp_min(1e-10).log()).sum().item()
             ent_by_layer[ell].append(ent)
-        cur = o.logits[:, -1:].argmax(-1, keepdim=True)
+        cur = o.logits[:, -1:].argmax(-1)
 
     th: Dict[int, float] = {}
     for ell, vals in ent_by_layer.items():
