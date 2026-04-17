@@ -1,2 +1,7 @@
 numpy>=1.21.0
 scipy>=1.7.0
+
+# Optional: enables the PyTorch backend (model_torch.py, wadi_torch.py,
+# benchmark_torch.py). Install with `pip install -r requirements.txt torch`
+# or add a CUDA build from https://pytorch.org/ for GPU acceleration.
+# torch>=2.0

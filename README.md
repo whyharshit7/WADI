@@ -99,20 +99,23 @@ P90         397,148,160    65%      13.2       2.31x     {L4:17, L8:2, L16:61}
 - Python 3.8+
 - NumPy
 - SciPy (for benchmarks only)
+- **PyTorch (optional)** — required only for the GPU / `torch` backend
 
 ```bash
-pip install numpy scipy
+pip install numpy scipy            # reference implementation
+pip install torch                  # optional: enables the Torch backend
 ```
 
 ### Run the Benchmark
 
 ```bash
-python benchmark.py
+python benchmark.py                # NumPy reference implementation
+python benchmark_torch.py          # Torch backend (auto-uses CUDA if available)
 ```
 
-This runs all three inference strategies (Standard AR, Speculative Decoding, WADI) on a 16-layer transformer and prints a full comparison with latency analysis.
+`benchmark.py` runs all three inference strategies (Standard AR, Speculative Decoding, WADI) on a 16-layer transformer and prints a full comparison with latency analysis. `benchmark_torch.py` repeats the Torch-side sanity run with weights transferred from the NumPy model, so results are directly comparable.
 
-### Use WADI in Your Code
+### Use WADI in Your Code (NumPy backend)
 
 ```python
 from model import Transformer, TransformerConfig
@@ -147,13 +150,48 @@ stats = engine.get_stats()
 print(stats.summary())
 ```
 
+### Use WADI on GPU (Torch backend)
+
+```python
+import torch
+from model import Transformer, TransformerConfig               # NumPy, for distillation
+from model_torch import TorchTransformer, TorchTransformerConfig
+from wadi_torch import WADIEngineTorch, WADITorchConfig
+
+# 1) Train / distill exits on the NumPy reference (fast, deterministic).
+np_cfg = TransformerConfig(
+    vocab_size=32000, n_layers=32, n_heads=16,
+    d_model=512, d_ff=2048, max_seq_len=1024,
+    exit_layers=[8, 16, 24, 32],
+)
+np_model = Transformer(np_cfg)
+np_model.simulate_trained_exits(n_calibration=500)
+
+# 2) Instantiate the Torch transformer with matching architecture, transfer
+#    weights, and move to GPU.
+t_cfg = TorchTransformerConfig(**{k: getattr(np_cfg, k)
+                                   for k in TorchTransformerConfig.__dataclass_fields__})
+t_model = TorchTransformer(t_cfg)
+t_model.load_from_numpy(np_model)
+t_model = t_model.to("cuda")
+
+# 3) Generate on GPU.
+engine = WADIEngineTorch(t_model, WADITorchConfig(max_draft_len=6))
+output = engine.generate([1, 50, 200, 15], max_new_tokens=100)
+```
+
+Want to train the Torch model from scratch or fine-tune real LLM weights into it? Skip step 1 and call `t_model.train()` directly — `TorchTransformer` is a standard `nn.Module`.
+
 ## Project Structure
 
 ```
 wadi/
-├── model.py          # Pure NumPy transformer with KV-cache & exit heads
-├── wadi.py           # WADI engine + AR and speculative decoding baselines
-├── benchmark.py      # Full comparison benchmark
+├── model.py              # Pure NumPy transformer with KV-cache & exit heads
+├── wadi.py               # WADI engine + AR and speculative decoding baselines (NumPy)
+├── benchmark.py          # Full NumPy comparison benchmark
+├── model_torch.py        # PyTorch transformer with KV-cache & exit heads
+├── wadi_torch.py         # WADI engine using the Torch backend
+├── benchmark_torch.py    # Torch sanity benchmark (auto-uses CUDA)
 ├── requirements.txt
 ├── LICENSE
 └── README.md
@@ -179,6 +217,27 @@ wadi/
 - Threshold sensitivity sweep (P10–P90)
 - Latency-oriented sequential pass counting
 - Scaling projections to 70B-class models
+
+### `model_torch.py` / `wadi_torch.py` — PyTorch Backend
+
+A drop-in PyTorch port of the reference implementation:
+
+- Standard `nn.Module` so the whole model is trainable, jittable, and moves to GPU with `.to("cuda")`.
+- **Fused Q/K/V projection** via a single `nn.Linear(d, 3·d)`.
+- Uses `torch.nn.functional.scaled_dot_product_attention` — gets Flash-style fused attention on modern GPUs automatically.
+- Preallocated `TorchKVCache` with per-layer truncation (matches the NumPy version's API).
+- `TorchTransformer.load_from_numpy(np_model)` — byte-for-byte weight transfer so you can distill exits with the NumPy model (cheap) and run inference with Torch (fast on GPU).
+- Same `full_forward_single`, `full_forward_batch`, `forward_with_exits`, `forward_to_layer` surface as the NumPy version.
+
+## Performance Notes
+
+The reference implementation has been tuned for a few easy wins that keep the algorithm identical but drop wall-clock:
+
+- **Batched verification** — a single K-token forward replaces K sequential single-token forwards in both the WADI engine and the speculative decoding baseline. Same total FLOPs, much better BLAS utilization.
+- **Fused Q/K/V** — three einsums collapsed into one `(S, D) @ (D, 3·D)` matmul per layer.
+- **Vectorized distillation** — `simulate_trained_exits` now runs all calibration samples through the stack in parallel (they're independent), rather than one-at-a-time with a fresh KV cache each. In the default 200-sample setup this is ~25× faster.
+
+All optimizations preserve the public API (`full_forward_single`, `WADIEngine.generate`, etc.) and the algorithm (entropy-guided draft, rejection-sampling verify, adaptive thresholds).
 
 ## Limitations
 

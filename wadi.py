@@ -204,47 +204,58 @@ class WADIEngine:
                            verify_start_pos: int,
                            context_token: int) -> Tuple[List[int], int, Dict[int, int], Dict[int, int]]:
         """
-        Verify draft tokens using full-depth forward passes.
-        Uses rejection sampling for lossless generation.
+        Verify draft tokens using one full-depth batched forward pass over
+        [context_token, draft[0], ..., draft[K-2]].
 
-        Returns (accepted_tokens, n_accepted).
+        The output at position i is the full-model distribution for draft[i],
+        which is exactly what we need for the rejection-sampling check.
+        Using a single K-token forward instead of K sequential 1-token
+        forwards yields a large wall-clock speedup (same total FLOPs).
+
+        Uses rejection sampling for lossless generation.
         """
         self.stats.verification_passes += 1
-        accepted_tokens = []
-        accepted_by_exit = {}
-        rejected_by_exit = {}
+        accepted_tokens: List[int] = []
+        accepted_by_exit: Dict[int, int] = {}
+        rejected_by_exit: Dict[int, int] = {}
 
-        # We need to verify: given context, is each draft token acceptable?
-        # Run the full model on the context token first to get p_full for draft[0]
-        current_token = context_token
+        # Build the K-token verification input. Position 0 is context_token,
+        # positions 1..K-1 are draft[0..K-2]. We don't include draft[K-1]
+        # because we never need the distribution "after" it (we'd only need
+        # that to sample a bonus token, which this algorithm skips).
+        K = len(drafts)
+        verify_input = np.empty(K, dtype=np.int64)
+        verify_input[0] = context_token
+        if K > 1:
+            verify_input[1:] = [d.token_id for d in drafts[:-1]]
 
+        self.model.reset_flops()
+        full_probs_batch, _ = self.model.full_forward_batch(
+            verify_input, verify_cache, verify_start_pos
+        )
+        self.stats.flops_verify += self.model.get_flops()
+
+        # Walk the K draft tokens against the K returned distributions,
+        # stopping at the first rejection. The KV cache was updated for all
+        # K positions by the batched forward; the outer generate() loop
+        # truncates it back to the accepted prefix.
         for i, draft in enumerate(drafts):
             ell = draft.exit_layer
-            self.model.reset_flops()
+            full_probs = full_probs_batch[i]
 
-            # Full-depth forward pass
-            full_probs, full_entropy = self.model.full_forward_single(
-                current_token, verify_cache, verify_start_pos + i
-            )
-            self.stats.flops_verify += self.model.get_flops()
-
-            # Rejection sampling criterion
             draft_prob = draft.draft_probs[draft.token_id]
             full_prob = full_probs[draft.token_id]
 
-            # Accept with probability min(1, p_full / p_draft)
+            # Accept with probability min(1, p_full / p_draft).
             accept_ratio = min(1.0, full_prob / (draft_prob + 1e-10))
 
             if self.rng.random() < accept_ratio:
-                # Accept this draft token
-                accepted_tokens.append(draft.token_id)
-                current_token = draft.token_id
+                accepted_tokens.append(int(draft.token_id))
                 self.stats.accepted_draft_tokens += 1
                 self.stats.exit_layer_accepted[ell] = self.stats.exit_layer_accepted.get(ell, 0) + 1
                 accepted_by_exit[ell] = accepted_by_exit.get(ell, 0) + 1
             else:
-                # Reject: resample from adjusted distribution
-                # p_adjusted(x) = max(0, p_full(x) - p_draft(x)) / Z
+                # Reject: resample from max(0, p_full - p_draft), renormalized.
                 adjusted = np.maximum(0, full_probs - draft.draft_probs)
                 z = np.sum(adjusted)
                 if z > 1e-10:
@@ -252,11 +263,11 @@ class WADIEngine:
                     resampled = self._sample_token(adjusted)
                 else:
                     resampled = self._sample_token(full_probs)
-                accepted_tokens.append(resampled)
+                accepted_tokens.append(int(resampled))
                 self.stats.rejected_draft_tokens += 1
                 self.stats.exit_layer_rejected[ell] = self.stats.exit_layer_rejected.get(ell, 0) + 1
                 rejected_by_exit[ell] = rejected_by_exit.get(ell, 0) + 1
-                break  # Discard remaining drafts
+                break  # Discard remaining drafts.
 
         return accepted_tokens, len(accepted_tokens), accepted_by_exit, rejected_by_exit
 
@@ -472,25 +483,29 @@ class SpeculativeDecodingBaseline:
                 draft_current = tok
                 draft_pos += 1
 
-            # Verify phase
+            # Verify phase — single batched forward on the target model.
+            # Also keep the draft cache in sync (one batched forward there too).
+            K = len(draft_tokens)
+            verify_input = np.empty(K, dtype=np.int64)
+            verify_input[0] = current_token
+            if K > 1:
+                verify_input[1:] = draft_tokens[:-1]
+
+            target_probs_batch, _ = self.target.full_forward_batch(
+                verify_input, target_cache, current_pos
+            )
+            self.draft.full_forward_batch(verify_input, draft_cache, current_pos)
+
             accepted_tokens = []
-            verify_current = current_token
-
             for i, dtok in enumerate(draft_tokens):
-                pos = current_pos + i
-                target_probs, _ = self.target.full_forward_single(
-                    verify_current, target_cache, pos
-                )
-                self.draft.full_forward_single(verify_current, draft_cache, pos)
-
+                target_probs = target_probs_batch[i]
                 tp = target_probs[dtok]
                 dp = draft_probs_list[i][dtok]
                 accept_ratio = min(1.0, tp / (dp + 1e-10))
 
                 self.total += 1
                 if self.rng.random() < accept_ratio:
-                    accepted_tokens.append(dtok)
-                    verify_current = dtok
+                    accepted_tokens.append(int(dtok))
                     self.accepted += 1
                 else:
                     adjusted = np.maximum(0, target_probs - draft_probs_list[i])
@@ -500,7 +515,7 @@ class SpeculativeDecodingBaseline:
                         resampled = self.rng.choice(len(adjusted), p=adjusted)
                     else:
                         resampled = self.rng.choice(len(target_probs), p=target_probs)
-                    accepted_tokens.append(resampled)
+                    accepted_tokens.append(int(resampled))
                     break
 
             generated.extend(accepted_tokens)

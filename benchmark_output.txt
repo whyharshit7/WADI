@@ -19,49 +19,50 @@ Pure NumPy | Measuring: FLOPs, sequential passes, acceptance rates
   Thresholds (P50): {4:5.90, 8:6.05, 12:6.17, 16:inf}
 
 --- 3. Standard Autoregressive ---
-  Total FLOPs:          239,075,328
+  Total FLOPs:          235,929,600
   Sequential passes: 60
 
 --- 4. Speculative Decoding ---
-  Total FLOPs:          360,185,856
-  Acceptance rate:   86.7%
-  Avg tokens/round:  5.3
-  Rounds:            11.2
-  Effective passes:  22
+  Total FLOPs:          450,625,536
+  Acceptance rate:   85.0%
+  Avg tokens/round:  5.2
+  Rounds:            11.4
+  Effective passes:  23
 
 --- 5. WADI Inference ---
 === WADI Inference Statistics ===
   Tokens generated:        60
-  Total draft tokens:      75
-  Accepted drafts:         54
-  Rejected drafts:         6
-  Acceptance rate:         72.0%
-  Verification passes:     13
-  Avg tokens/verify:       5.8
-  Avg exit depth:          13.3
-  Exit layer distribution: {4: 15, 8: 3, 16: 57}
-  Draft FLOPs:             195,821,568
-  Verify FLOPs:            188,743,680
-  Total FLOPs:             384,565,248
-  Avg tokens accepted/round: 4.6
-  Avg draft depth fraction:  0.83
-  Passes per round:          1.83
-  Effective passes:          24
+  Total draft tokens:      86
+  Accepted drafts:         51
+  Rejected drafts:         9
+  Acceptance rate:         59.3%
+  Verification passes:     15
+  Avg tokens/verify:       5.7
+  Avg exit depth:          8.7
+  Exit layer distribution: {4: 37, 8: 10, 12: 27, 16: 12}
+  Exit acceptance:         {4: 0.739, 8: 0.714, 12: 0.952, 16: 1.0}
+  Draft FLOPs:             146,276,352
+  Verify FLOPs:            270,532,608
+  Total FLOPs:             416,808,960
+  Avg tokens accepted/round: 4.0
+  Avg draft depth fraction:  0.54
+  Passes per round:          1.54
+  Effective passes:          23
 
 --- 6. WADI Threshold Sweep ---
   Pctile        FLOPs  Acpt  Depth Tok/Rnd  Passes  Exits
   ------------------------------------------------------------------------
-  P  10  368,836,608  81%   13.5     5.0      22   {4: 12, 8: 3, 12: 1, 16: 52}
-  P  20  401,866,752  69%   14.1     4.6      24   {4: 11, 8: 2, 16: 64}
-  P  30  407,371,776  65%   13.7     4.3      26   {4: 14, 8: 2, 16: 65}
-  P  40  386,924,544  72%   13.4     4.6      24   {4: 14, 8: 3, 16: 58}
-  P  50  384,565,248  72%   13.3     4.6      24   {4: 15, 8: 3, 16: 57}
-  P  60  368,050,176  80%   13.0     5.0      22   {4: 16, 8: 2, 16: 52}
-  P  70  357,040,128  85%   12.6     5.0      21   {4: 18, 8: 2, 16: 48}
-  P  80  371,982,336  68%   11.9     4.6      23   {4: 25, 8: 2, 16: 51}
-  P  90  397,148,160  65%   13.2     4.3      26   {4: 17, 8: 2, 16: 61}
+  P  10  380,633,088  82%   12.5     5.0      21   {4: 2, 8: 2, 12: 50, 16: 14}
+  P  20  406,585,344  79%   13.5     5.0      22   {4: 9, 8: 6, 12: 4, 16: 51}
+  P  30  423,100,416  73%   12.7     4.6      23   {4: 17, 8: 4, 12: 3, 16: 51}
+  P  40  484,442,112  53%   10.8     3.5      28   {4: 19, 8: 6, 12: 51, 16: 16}
+  P  50  416,808,960  59%    8.7     4.0      23   {4: 37, 8: 10, 12: 27, 16: 12}
+  P  60  436,469,760  53%    7.9     3.8      24   {4: 44, 8: 18, 12: 21, 16: 10}
+  P  70  435,683,328  54%    7.8     3.8      24   {4: 36, 8: 28, 12: 26, 16: 3}
+  P  80  477,364,224  55%    9.8     3.8      26   {4: 23, 8: 6, 12: 64, 16: 1}
+  P  90  496,238,592  48%    8.5     3.3      28   {4: 48, 8: 18, 12: 13, 16: 24}
 
-  Best: P70 with 21 effective passes (vs 60 for AR)
+  Best: P10 with 21 effective passes (vs 60 for AR)
 
 ================================================================
   RESULTS
@@ -69,9 +70,9 @@ Pure NumPy | Measuring: FLOPs, sequential passes, acceptance rates
 
   Method                    FLOPs  Seq Passes  Latency Speedup
   --------------------------------------------------------------
-  Standard AR         239,075,328          60            1.00x
-  Spec. Decoding      360,185,856          22            2.67x
-  WADI                384,565,248          24            2.52x
+  Standard AR         235,929,600          60            1.00x
+  Spec. Decoding      450,625,536          23            2.62x
+  WADI                416,808,960          23            2.60x
 
 --- Projections for Trained Models ---
   Real trained models achieve 70-90% acceptance with well-distilled exits.

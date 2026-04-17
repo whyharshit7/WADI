@@ -147,7 +147,12 @@ class KVCache:
 
 
 class TransformerLayer:
-    """Single transformer block: Pre-Norm MHA + Pre-Norm FFN."""
+    """Single transformer block: Pre-Norm MHA + Pre-Norm FFN.
+
+    Uses a fused Q/K/V projection (single matmul) for speed. The original
+    (W_q, W_k, W_v) weights are kept as separate views so downstream code
+    that introspects them still works.
+    """
 
     def __init__(self, config: TransformerConfig, layer_idx: int, rng: np.random.Generator):
         d = config.d_model
@@ -174,47 +179,59 @@ class TransformerLayer:
         self.layer_idx = layer_idx
         self.n_heads = h
         self.d_head = dh
+        self.d_model = d
         self.attn_scale = 1.0 / np.sqrt(dh)
 
+        # Fused (d, 3 * h * dh) weight for a single Q/K/V matmul.
+        # Flat 2D shape hits BLAS GEMM directly without einsum overhead.
+        self._rebuild_fused_qkv()
+
+        # Flat (h*dh, d) output projection for a single matmul.
+        self._W_o_flat = self.W_o.reshape(h * dh, d)
+
+    def _rebuild_fused_qkv(self):
+        h, dh, d = self.n_heads, self.d_head, self.d_model
+        self._W_qkv = np.concatenate(
+            [
+                self.W_q.reshape(d, h * dh),
+                self.W_k.reshape(d, h * dh),
+                self.W_v.reshape(d, h * dh),
+            ],
+            axis=1,
+        ).astype(np.float32)
+
     def attention(self, x, kv_cache: Optional[KVCache] = None):
-        seq_len = x.shape[0]
+        seq_len, d = x.shape
+        h, dh = self.n_heads, self.d_head
 
-        if seq_len == 1:
-            x0 = x[0]
-            Q = np.einsum('d,dhk->hk', x0, self.W_q)
-            K = np.einsum('d,dhk->hk', x0, self.W_k)[:, np.newaxis, :]
-            V = np.einsum('d,dhk->hk', x0, self.W_v)[:, np.newaxis, :]
-
-            if kv_cache is not None:
-                kv_cache.update(self.layer_idx, K, V)
-                K, V = kv_cache.get(self.layer_idx)
-
-            scores = np.einsum('hd,hkd->hk', Q, K) * self.attn_scale
-            attn = softmax(scores, axis=-1)
-            out = np.einsum('hk,hkd->hd', attn, V)
-            return np.einsum('hd,hdo->o', out, self.W_o)[np.newaxis, :]
-
-        Q = np.einsum('sd,dhk->shk', x, self.W_q).transpose(1, 0, 2)
-        K = np.einsum('sd,dhk->shk', x, self.W_k).transpose(1, 0, 2)
-        V = np.einsum('sd,dhk->shk', x, self.W_v).transpose(1, 0, 2)
+        # One fused GEMM produces Q, K, V concatenated.
+        qkv = x @ self._W_qkv  # (s, 3*h*dh)
+        qkv = qkv.reshape(seq_len, 3, h, dh)
+        # (h, s, dh) for each — contiguous for the matmuls that follow.
+        Q = np.ascontiguousarray(qkv[:, 0].transpose(1, 0, 2))
+        K = np.ascontiguousarray(qkv[:, 1].transpose(1, 0, 2))
+        V = np.ascontiguousarray(qkv[:, 2].transpose(1, 0, 2))
 
         if kv_cache is not None:
             kv_cache.update(self.layer_idx, K, V)
             K, V = kv_cache.get(self.layer_idx)
 
-        scores = np.einsum('hqd,hkd->hqk', Q, K) * self.attn_scale
+        # (h, s, dh) @ (h, dh, kv) -> (h, s, kv)
+        scores = np.matmul(Q, K.transpose(0, 2, 1)) * self.attn_scale
 
         kv_len = K.shape[1]
-        q_positions = np.arange(kv_len - seq_len, kv_len)
-        k_positions = np.arange(kv_len)
-        mask = q_positions[:, None] < k_positions[None, :]
-        scores[:, mask] = -1e9
+        if seq_len > 1:
+            # Causal mask for multi-token input: each query position attends
+            # only to keys up to and including itself.
+            q_positions = np.arange(kv_len - seq_len, kv_len)
+            k_positions = np.arange(kv_len)
+            mask = q_positions[:, None] < k_positions[None, :]
+            scores[:, mask] = -1e9
 
         attn = softmax(scores, axis=-1)
-        out = np.einsum('hqk,hkd->hqd', attn, V)
-        out = out.transpose(1, 0, 2)
-        out = np.einsum('shd,hdo->so', out, self.W_o)
-        return out
+        # (h, s, kv) @ (h, kv, dh) -> (h, s, dh) -> (s, h*dh)
+        out = np.matmul(attn, V).transpose(1, 0, 2).reshape(seq_len, h * dh)
+        return out @ self._W_o_flat
 
     def ffn(self, x):
         h = gelu(x @ self.W1 + self.b1)
@@ -307,6 +324,29 @@ class Transformer:
         x_normed = layer_norm(x, self.final_ln_g, self.final_ln_b)
         return self.exit_heads[self.config.n_layers].get_probs(x_normed[-1])
 
+    def full_forward_batch(self, token_ids, kv_cache, start_pos):
+        """
+        Full forward pass over a sequence of K tokens in a single call.
+
+        This is the fast verification path for speculative / self-speculative
+        decoding: instead of K sequential single-token forwards, we run one
+        K-token pass with a causal mask. FLOP accounting is unchanged
+        (total work is the same), but wall-clock drops because BLAS GEMMs
+        are fed much larger matrices.
+
+        Returns (probs, entropies) of shape (K, vocab) and (K,).
+        """
+        token_ids = np.asarray(token_ids, dtype=np.int64)
+        K = int(token_ids.shape[0])
+        x = self.embed(token_ids, start_pos=start_pos)
+        x = self.forward_layer_range(x, 0, self.config.n_layers, kv_cache)
+        x_normed = layer_norm(x, self.final_ln_g, self.final_ln_b)
+        head = self.exit_heads[self.config.n_layers]
+        logits = head.logits(x_normed)  # (K, vocab)
+        probs = softmax(logits, axis=-1)
+        entropies = -np.sum(probs * np.log(probs + 1e-10), axis=-1)
+        return probs, entropies
+
     def forward_with_exits(self, token_id, kv_cache, pos):
         """
         Forward pass that yields (hidden_state, probs, entropy, exit_layer)
@@ -356,71 +396,96 @@ class Transformer:
             results.append((probs, entropy))
         return results
 
+    def _independent_layer_forward(self, x, layer_idx):
+        """
+        Apply a single transformer layer to a stack of N independent
+        single-token samples in parallel.
+
+        x: (N, d_model) — each row is a separate "sequence of length 1"
+        returns: (N, d_model)
+
+        When each sample has only one token at position 0, self-attention
+        softmax is over a single score and always equals 1.0, so the
+        attention output reduces to V projected through W_o. This lets us
+        run the whole batch as a few flat GEMMs — orders of magnitude faster
+        than looping N times with a fresh KV cache.
+        """
+        layer = self.layers[layer_idx]
+        h, dh, d = layer.n_heads, layer.d_head, layer.d_model
+
+        normed = layer_norm(x, layer.ln1_g, layer.ln1_b)
+        qkv = normed @ layer._W_qkv  # (N, 3*h*dh)
+        # We only need V — Q/K don't affect the output for a 1-token attention.
+        V = qkv[:, 2 * h * dh :]  # (N, h*dh)
+        attn_out = V @ layer._W_o_flat  # (N, d)
+        x = x + attn_out
+
+        normed = layer_norm(x, layer.ln2_g, layer.ln2_b)
+        x = x + layer.ffn(normed)
+        return x
+
     def simulate_trained_exits(self, n_calibration=200, seed=42):
         """
-        Simulate distillation training by actually fitting exit heads to
-        match the full model's predictions on calibration data.
+        Simulate distillation training by fitting exit heads to match the
+        full model's predictions on calibration data.
 
         For each exit layer, we:
         1. Collect hidden states and full-model target logits
-        2. Fit the exit head via least-squares to minimize MSE on logits
-        3. Shallower heads have more noise (harder to match from shallow repr)
+        2. Fit the exit head via ridge-regularized least squares on logits
+        3. Add depth-proportional noise (shallower = more noise) to mimic
+           the reality that shallower heads can't perfectly match the full
+           model.
+
+        The calibration tokens are independent single-token samples with no
+        shared context, so we can process all of them as one batched forward
+        through the layers — this is ~50-100x faster than the original
+        one-token-at-a-time loop.
         """
         rng = np.random.default_rng(seed)
         config = self.config
         final_layer = config.n_layers
         final_head = self.exit_heads[final_layer]
 
-        # Generate calibration tokens
+        # Generate calibration tokens.
         cal_tokens = rng.integers(0, config.vocab_size, size=n_calibration)
 
-        # For each exit layer, collect (hidden_state, target_logits) pairs
+        # Batched forward: treat calibration samples as an independent axis.
+        # All samples share position 0, so pos_emb[0] is the same row everywhere.
+        x = self.tok_emb[cal_tokens] + self.pos_emb[0][None, :]  # (N, d_model)
+
+        hidden_by_layer = {}  # ell -> (N, d_model) hidden state at that exit
         exit_layers = sorted(self.exit_heads.keys())
+
+        li = 0
+        for ell in exit_layers:
+            while li < ell:
+                x = self._independent_layer_forward(x, li)
+                li += 1
+            hidden_by_layer[ell] = x.copy()
+
+        # Final hidden state is at `final_layer`.
+        h_full = hidden_by_layer[final_layer]
+        T = final_head.logits(h_full)  # (N, vocab)
 
         for ell in exit_layers:
             if ell == final_layer:
                 continue
 
-            hidden_states = []
-            target_logits = []
-
-            # Simple KV cache per token (no sequence context for calibration)
-            for tok in cal_tokens:
-                # Get hidden state at exit layer
-                cache = KVCache(config.n_layers)
-                x = self.embed(np.array([tok]), start_pos=0)
-                # Forward to exit layer
-                for li in range(ell):
-                    x = self.layers[li].forward(x, cache)
-                h_exit = x[-1].copy()
-
-                # Get full model hidden state and target logits
-                for li in range(ell, final_layer):
-                    x = self.layers[li].forward(x, cache)
-                h_full = x[-1]
-                target_lgts = final_head.logits(h_full[np.newaxis, :])[0]
-
-                hidden_states.append(h_exit)
-                target_logits.append(target_lgts)
-
-            H = np.stack(hidden_states)  # (n_cal, d_model)
-            T = np.stack(target_logits)  # (n_cal, vocab_size)
-
-            # Normalize hidden states through exit head's layer norm
+            H = hidden_by_layer[ell]  # (N, d_model)
             head = self.exit_heads[ell]
-            H_normed = np.zeros_like(H)
-            for i in range(len(H)):
-                H_normed[i] = layer_norm(H[i:i+1], head.ln_g, head.ln_b)[0]
 
-            # Fit W and b via least squares: H_normed @ W + b ≈ T
-            # Add bias column
-            H_aug = np.concatenate([H_normed, np.ones((len(H_normed), 1))], axis=1)
+            # Apply this head's LayerNorm to all samples at once.
+            H_normed = layer_norm(H, head.ln_g, head.ln_b)
 
-            # Solve via pseudoinverse (ridge regression for stability)
-            ridge = 0.01 * np.eye(H_aug.shape[1])
+            # Ridge-regularized least squares: H_aug @ W_fit ≈ T
+            H_aug = np.concatenate(
+                [H_normed, np.ones((H_normed.shape[0], 1), dtype=H_normed.dtype)],
+                axis=1,
+            )
+            ridge = 0.01 * np.eye(H_aug.shape[1], dtype=H_aug.dtype)
             W_fit = np.linalg.solve(H_aug.T @ H_aug + ridge, H_aug.T @ T)
 
-            # Add depth-proportional noise (shallower = more noise)
+            # Depth-proportional noise (shallower = noisier head).
             depth_frac = ell / final_layer
             noise = rng.normal(0, 0.1 * (1 - depth_frac), W_fit.shape).astype(np.float32)
 
