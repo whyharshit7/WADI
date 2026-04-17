@@ -228,6 +228,21 @@ def calibrate_thresholds(
         vals = sorted(vals)
         th[ell] = float(vals[min(int(len(vals) * percentile / 100), len(vals) - 1)])
     th[L] = float("inf")  # final layer always exits
+
+    # Enforce monotonic non-decreasing thresholds across depth. A deeper
+    # exit should never demand *stricter* confidence than a shallower one —
+    # if the shallow head is undertrained (high-entropy), its threshold can
+    # blow up and swallow the deeper layers. Cap each shallow threshold by
+    # the smallest threshold of any deeper layer (excluding the final).
+    exits_sorted = sorted(th)
+    # Work from the second-deepest back to shallowest.
+    for i in range(len(exits_sorted) - 2, -1, -1):
+        cur_ell = exits_sorted[i]
+        nxt_ell = exits_sorted[i + 1]
+        if nxt_ell == L:
+            continue  # final layer is inf; don't use as upper bound
+        if th[cur_ell] > th[nxt_ell]:
+            th[cur_ell] = th[nxt_ell]
     return th
 
 
