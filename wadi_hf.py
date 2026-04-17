@@ -223,26 +223,25 @@ def calibrate_thresholds(
             ent_by_layer[ell].append(ent)
         cur = o.logits[:, -1:].argmax(-1)
 
+    # Use per-layer percentiles so each exit gets a threshold tuned to
+    # *its own* entropy distribution. Shallow heads are undertrained and
+    # have much higher entropy than deep ones; coupling them (e.g. via a
+    # monotonicity constraint) either starves shallow exits or drags deep
+    # ones down. Target lower percentiles for shallow layers: only exit
+    # when the shallow head is *very* confident.
+    exits_sorted = sorted(ell for ell in ent_by_layer if ell != L)
     th: Dict[int, float] = {}
-    for ell, vals in ent_by_layer.items():
-        vals = sorted(vals)
-        th[ell] = float(vals[min(int(len(vals) * percentile / 100), len(vals) - 1)])
+    n_exits = max(1, len(exits_sorted))
+    for i, ell in enumerate(exits_sorted):
+        # Interpolate per-layer target percentile: shallowest uses
+        # percentile/3, deepest (non-final) uses percentile. That keeps
+        # shallow exits selective and deep ones lenient.
+        frac = (i + 1) / n_exits  # 1/N..1
+        layer_pct = percentile * (1.0 / 3 + (2.0 / 3) * frac)
+        vals = sorted(ent_by_layer[ell])
+        idx = min(int(len(vals) * layer_pct / 100), len(vals) - 1)
+        th[ell] = float(vals[idx])
     th[L] = float("inf")  # final layer always exits
-
-    # Enforce monotonic non-decreasing thresholds across depth. A deeper
-    # exit should never demand *stricter* confidence than a shallower one —
-    # if the shallow head is undertrained (high-entropy), its threshold can
-    # blow up and swallow the deeper layers. Cap each shallow threshold by
-    # the smallest threshold of any deeper layer (excluding the final).
-    exits_sorted = sorted(th)
-    # Work from the second-deepest back to shallowest.
-    for i in range(len(exits_sorted) - 2, -1, -1):
-        cur_ell = exits_sorted[i]
-        nxt_ell = exits_sorted[i + 1]
-        if nxt_ell == L:
-            continue  # final layer is inf; don't use as upper bound
-        if th[cur_ell] > th[nxt_ell]:
-            th[cur_ell] = th[nxt_ell]
     return th
 
 
@@ -458,6 +457,11 @@ def main() -> None:
                    help="Path to save/load distilled exit heads.")
 
     p.add_argument("--threshold-percentile", type=float, default=50.0)
+    p.add_argument("--exit-layers", default=None,
+                   help="Comma-separated exit layer indices (1-based into the "
+                        "transformer blocks). Default: L/4, L/2, 3L/4. "
+                        "Example: --exit-layers 14,21 drops the shallowest exit, "
+                        "which often helps on small/undertrained heads.")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["float16", "bfloat16", "float32"])
     args = p.parse_args()
@@ -474,7 +478,13 @@ def main() -> None:
         param.requires_grad = False
 
     L = model.config.num_hidden_layers
-    exit_points = [max(1, L // 4), L // 2, (3 * L) // 4]
+    if args.exit_layers:
+        exit_points = sorted({int(x) for x in args.exit_layers.split(",") if x.strip()})
+        for e in exit_points:
+            if not (1 <= e < L):
+                raise ValueError(f"Exit layer {e} out of range [1, {L - 1}] for this model")
+    else:
+        exit_points = [max(1, L // 4), L // 2, (3 * L) // 4]
     print(f"Model: {L} layers, {model.config.hidden_size} hidden.")
     print(f"Exit points: {exit_points}")
 
