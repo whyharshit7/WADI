@@ -107,17 +107,6 @@ This is a proof of concept. The model uses random weights and simulated distilla
 4. Verify drafts with the standard rejection-sampling step — same math as existing speculative-decoding implementations.
 5. For maximum latency gains, overlap draft-token layer groups with CUDA streams.
 
-## Citation
-
-```bibtex
-@software{wadi2026,
-  title  = {WADI: Wavefront Adaptive-Depth Inference},
-  author = {Harshit Saxena},
-  year   = {2026},
-  url    = {https://github.com/whyharshit7/wadi}
-}
-```
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
